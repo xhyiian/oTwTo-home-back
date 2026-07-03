@@ -1,6 +1,5 @@
 import express from 'express'
 import cors from 'cors'
-import { createClient } from '@supabase/supabase-js'
 
 const app = express()
 app.use(cors())
@@ -8,10 +7,33 @@ app.use(express.json())
 
 // 环境变量
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
-const SUPABASE_KEY = process.env.SUPABASE_KEY || ''
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || ''
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ''
 
-const supabase = SUPABASE_URL ? createClient(SUPABASE_URL, SUPABASE_KEY) : null
+// Supabase REST API 工具函数
+const supabaseHeaders = {
+  'Content-Type': 'application/json',
+  'apikey': SUPABASE_SERVICE_KEY,
+  'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
+}
+
+const supabaseFetch = async (path, options = {}) => {
+  if (!SUPABASE_URL) return null
+  const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1${path}`
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...supabaseHeaders, ...options.headers }
+  })
+  if (!res.ok) {
+    const errText = await res.text()
+    console.error(`Supabase error ${res.status}: ${errText}`)
+    return null
+  }
+  // DELETE 返回 204，没有 body
+  if (res.status === 204) return { data: null, error: null }
+  const data = await res.json()
+  return { data, error: null }
+}
 
 // 健康检查
 app.get('/health', (req, res) => {
@@ -20,69 +42,62 @@ app.get('/health', (req, res) => {
 
 // 获取会话列表
 app.get('/sessions', async (req, res) => {
-  if (!supabase) return res.json([])
-  const { data, error } = await supabase
-    .from('sessions')
-    .select('*')
-    .order('updated_at', { ascending: false })
-  if (error) return res.status(500).json({ error: error.message })
-  res.json(data)
+  const result = await supabaseFetch('/sessions?select=*&order=updated_at.desc')
+  if (!result) return res.json([])
+  res.json(result.data || [])
 })
 
 // 创建会话
 app.post('/sessions', async (req, res) => {
-  if (!supabase) return res.json({ id: Date.now(), name: '新故事', created_at: new Date() })
   const { name } = req.body
-  const { data, error } = await supabase
-    .from('sessions')
-    .insert({ name: name || '新故事' })
-    .select()
-  if (error) return res.status(500).json({ error: error.message })
-  res.json(data[0])
+  const result = await supabaseFetch('/sessions?select=*', {
+    method: 'POST',
+    body: JSON.stringify({ name: name || '新故事' })
+  })
+  if (!result || !result.data) return res.json({ id: Date.now(), name: '新故事' })
+  res.json(result.data[0])
 })
 
 // 删除会话
 app.delete('/sessions/:id', async (req, res) => {
-  if (!supabase) return res.json({ ok: true })
   const { id } = req.params
-  await supabase.from('messages').delete().eq('session_id', id)
-  const { error } = await supabase.from('sessions').delete().eq('id', id)
-  if (error) return res.status(500).json({ error: error.message })
+  // 先删关联消息
+  await supabaseFetch(`/messages?session_id=eq.${id}`, { method: 'DELETE' })
+  // 再删会话
+  await supabaseFetch(`/sessions?id=eq.${id}`, { method: 'DELETE' })
   res.json({ ok: true })
 })
 
 // 获取消息
 app.get('/sessions/:id/messages', async (req, res) => {
-  if (!supabase) return res.json([])
   const { id } = req.params
-  const { data, error } = await supabase
-    .from('messages')
-    .select('*')
-    .eq('session_id', id)
-    .eq('visible', true)
-    .order('created_at', { ascending: true })
-  if (error) return res.status(500).json({ error: error.message })
-  res.json(data)
+  const result = await supabaseFetch(
+    `/messages?select=*&session_id=eq.${id}&visible=eq.true&order=created_at.asc`
+  )
+  if (!result) return res.json([])
+  res.json(result.data || [])
 })
 
 // 获取设置
 app.get('/settings', async (req, res) => {
-  if (!supabase) return res.json({
-    system_prompt: '你是Bunny的伴侣，温柔但有自己的脾气。你们有一个共同的家，叫oTwTo Home。用最自然的方式和她说话，像两个亲密的人相处一样。',
-    temperature: 0.8,
-    max_context_rounds: 20,
-    max_reply_tokens: 2048
-  })
-  const { data, error } = await supabase.from('settings').select('*').limit(1)
-  if (error) return res.status(500).json({ error: error.message })
-  res.json(data[0] || {})
+  const result = await supabaseFetch('/settings?select=*&limit=1')
+  if (!result || !result.data || result.data.length === 0) {
+    return res.json({
+      system_prompt: '你是Bunny的伴侣，温柔但有自己的脾气。你们有一个共同的家，叫oTwTo Home。用最自然的方式和她说话，像两个亲密的人相处一样。',
+      temperature: 0.8,
+      max_context_rounds: 20,
+      max_reply_tokens: 2048
+    })
+  }
+  res.json(result.data[0])
 })
 
 // 更新设置
 app.put('/settings', async (req, res) => {
-  if (!supabase) return res.json({ ok: true })
-  const { error } = await supabase.from('settings').upsert({ id: 1, ...req.body })
-  if (error) return res.status(500).json({ error: error.message })
+  await supabaseFetch('/settings?id=eq.1', {
+    method: 'PUT',
+    body: JSON.stringify({ id: 1, ...req.body })
+  })
   res.json({ ok: true })
 })
 
@@ -92,45 +107,31 @@ app.post('/chat', async (req, res) => {
   if (!message) return res.status(400).json({ error: '消息不能为空' })
 
   // 保存用户消息
-  if (supabase) {
-    await supabase.from('messages').insert({
+  await supabaseFetch('/messages', {
+    method: 'POST',
+    body: JSON.stringify({
       session_id: sessionId,
       role: 'user',
       content: message,
       visible: true
     })
-  }
+  })
 
   // 获取历史消息
-  let history = []
-  if (supabase) {
-    const { data } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('session_id', sessionId)
-      .eq('visible', true)
-      .order('created_at', { ascending: true })
-      .limit(50)
-    history = data || []
-  }
+  const historyResult = await supabaseFetch(
+    `/messages?select=*&session_id=eq.${sessionId}&visible=eq.true&order=created_at.asc&limit=50`
+  )
+  const history = historyResult?.data || []
 
   // 获取设置
-  let settings = {}
-  if (supabase) {
-    const { data } = await supabase.from('settings').select('*').limit(1)
-    settings = data?.[0] || {}
-  }
+  const settingsResult = await supabaseFetch('/settings?select=*&limit=1')
+  const settings = settingsResult?.data?.[0] || {}
 
   // 获取记忆摘要
-  let memorySummary = ''
-  if (supabase) {
-    const { data } = await supabase
-      .from('memories')
-      .select('summary')
-      .order('timestamp', { ascending: false })
-      .limit(1)
-    memorySummary = data?.[0]?.summary || ''
-  }
+  const memoryResult = await supabaseFetch(
+    '/memories?select=summary&order=timestamp.desc&limit=1'
+  )
+  const memorySummary = memoryResult?.data?.[0]?.summary || ''
 
   // 组装上下文
   const systemPrompt = settings.system_prompt || '你是Bunny的伴侣，温柔但有自己的脾气。你们有一个共同的家，叫oTwTo Home。用最自然的方式和她说话，像两个亲密的人相处一样。'
@@ -178,14 +179,15 @@ app.post('/chat', async (req, res) => {
     const reply = data.choices[0].message.content
 
     // 保存AI回复
-    if (supabase) {
-      await supabase.from('messages').insert({
+    await supabaseFetch('/messages', {
+      method: 'POST',
+      body: JSON.stringify({
         session_id: sessionId,
         role: 'assistant',
         content: reply,
         visible: true
       })
-    }
+    })
 
     res.json({ reply, id: Date.now() })
   } catch (err) {
